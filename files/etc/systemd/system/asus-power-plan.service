@@ -1,0 +1,13 @@
+[Unit]
+Description=ASUS VivoBook X515EA - limites de potencia e temperatura
+Documentation=file:/etc/asus-power-plan.conf
+After=power-profiles-daemon.service
+ConditionPathExists=/sys/firmware/acpi/platform_profile
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/asus-power-plan apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

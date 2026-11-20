@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+#
+# asus-power-plan — limites de potência e temperatura para
+# ASUS VivoBook 15 X515EA (i5-1135G7 / Iris Xe)
+#
+# O plano usa três camadas independentes:
+#   1. RAPL (powercap): PL1/PL2 do pacote (CPU + iGPU)
+#   2. intel_pstate/HWP: teto de frequência (max_perf_pct + scaling_max_freq)
+#   3. TCC offset: rede de segurança em hardware (throttle em Tjmax - offset)
+#
+# O perfil é lido de /sys/firmware/acpi/platform_profile, que é controlado
+# pelo power-profiles-daemon (KDE: Economia de energia / Equilibrado / Desempenho).
+#
+# Uso:
+#   asus-power-plan apply      aplica o plano do perfil ACPI atual (usado por udev)
+#   asus-power-plan status     mostra o estado atual
+#   asus-power-plan restore    devolve os limites de fábrica (28 W / 4,2 GHz / TCC 8)
+#
+set -u
+
+CONF="${ASUS_POWER_PLAN_CONF:-/etc/asus-power-plan.conf}"
+if [ -r "$CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
+fi
+
+# ---- Valores padrão (usados se o arquivo de config não existir) -------------
+: "${ECO_PL1_W:=12}"
+: "${ECO_PL2_W:=20}"
+: "${ECO_MAX_MHZ:=2400}"
+: "${ECO_TCC:=20}"          # throttle em 100 - 20 = 80 °C
+
+: "${BAL_PL1_W:=15}"
+: "${BAL_PL2_W:=25}"
+: "${BAL_MAX_MHZ:=3000}"
+: "${BAL_TCC:=15}"          # 85 °C
+
+: "${PERF_PL1_W:=22}"
+: "${PERF_PL2_W:=28}"
+: "${PERF_MAX_MHZ:=3200}"
+: "${PERF_TCC:=15}"         # 85 °C
+
+: "${BAT_PL1_DROP_W:=3}"    # quanto reduzir o PL1 na bateria (equilibrado/desempenho)
+: "${BAT_MAX_DROP_MHZ:=400}"
+: "${BAT_MIN_PL1_W:=12}"
+: "${BAT_MIN_MAX_MHZ:=2000}"
+
+RAPL="/sys/class/powercap/intel-rapl:0"
+PROFILE_FILE="/sys/firmware/acpi/platform_profile"
+AC_FILE="/sys/class/power_supply/AC0/online"
+
+# ---- Helpers ----------------------------------------------------------------
+
+# Escreve em um arquivo sysfs; ignora falhas (arquivo ausente / firmware sem suporte).
+wr() {
+    local file=$1 value=$2
+    [ -e "$file" ] || return 0
+    printf '%s\n' "$value" > "$file" 2>/dev/null || true
+}
+
+read_file() {
+    [ -r "$1" ] && cat "$1" 2>/dev/null || echo ""
+}
+
+acpi_profile() {
+    local p
+    p=$(read_file "$PROFILE_FILE")
+    [ -n "$p" ] && echo "$p" || echo "balanced"
+}
+
+plan_for_profile() {
+    case "$1" in
+        quiet)       echo "eco" ;;
+        performance) echo "gaming" ;;
+        *)           echo "balanced" ;;
+    esac
+}
+
+on_battery() {
+    [ "$(read_file "$AC_FILE")" = "0" ]
+}
+
+find_tcc() {
+    local f
+    for f in /sys/bus/pci/devices/*/tcc_offset_degree_celsius; do
+        if [ -e "$f" ]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cpu_max_mhz() {
+    local f=/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+    local khz
+    khz=$(read_file "$f")
+    if [ -n "$khz" ] && [ "$khz" -gt 0 ] 2>/dev/null; then
+        echo $(( khz / 1000 ))
+    else
+        echo 4200
+    fi
+}
+
+apply_plan() {
+    local plan=$1
+    local pl1 pl2 mhz tcc maxmhz pct pol dir
+
+    case "$plan" in
+        eco)      pl1=$ECO_PL1_W;  pl2=$ECO_PL2_W;  mhz=$ECO_MAX_MHZ;  tcc=$ECO_TCC ;;
+        gaming)   pl1=$PERF_PL1_W; pl2=$PERF_PL2_W; mhz=$PERF_MAX_MHZ; tcc=$PERF_TCC ;;
+        *)        pl1=$BAL_PL1_W;  pl2=$BAL_PL2_W;  mhz=$BAL_MAX_MHZ;  tcc=$BAL_TCC ;;
+    esac
+
+    # Na bateria, perfis "equilibrado" e "desempenho" ficam mais contidos.
+    if [ "$plan" != "eco" ] && on_battery; then
+        pl1=$(( pl1 - BAT_PL1_DROP_W ))
+        [ "$pl1" -lt "$BAT_MIN_PL1_W" ] && pl1=$BAT_MIN_PL1_W
+        mhz=$(( mhz - BAT_MAX_DROP_MHZ ))
+        [ "$mhz" -lt "$BAT_MIN_MAX_MHZ" ] && mhz=$BAT_MIN_MAX_MHZ
+    fi
+
+    # PL2 nunca abaixo do PL1 (RAPL rejeita essa combinação).
+    [ "$pl2" -lt "$pl1" ] && pl2=$pl1
+
+    # 1) TCC offset: limite físico de temperatura.
+    local tccf
+    if tccf=$(find_tcc); then
+        wr "$tccf" "$tcc"
+    fi
+
+    # 2) RAPL: PL2 primeiro, depois PL1.
+    wr "$RAPL/constraint_1_power_limit_uw" $(( pl2 * 1000000 ))
+    wr "$RAPL/constraint_0_power_limit_uw" $(( pl1 * 1000000 ))
+    local actual_pl1
+    actual_pl1=$(read_file "$RAPL/constraint_0_power_limit_uw")
+    if [ -n "$actual_pl1" ] && [ "$actual_pl1" -gt $(( (pl1 + 2) * 1000000 )) ]; then
+        command -v logger >/dev/null 2>&1 && \
+            logger -t asus-power-plan "PL1 nao aplicado: pedido ${pl1}W, atual $(( actual_pl1 / 1000000 ))W"
+    fi
+
+    # 3) Teto de frequência.
+    #    max_perf_pct primeiro (para permitir subir), depois o limite por policy.
+    maxmhz=$(cpu_max_mhz)
+    pct=$(( (mhz * 100 + maxmhz - 1) / maxmhz ))
+    wr /sys/devices/system/cpu/intel_pstate/max_perf_pct "$pct"
+    for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$dir" ] || continue
+        wr "$dir/scaling_max_freq" $(( mhz * 1000 ))
+    done
+
+    if [ "${VERBOSE:-0}" = "1" ]; then
+        printf 'plano=%s pl1=%sW pl2=%sW max=%sMHz tcc=%s (%s°C) pct=%s%%\n' \
+            "$plan" "$pl1" "$pl2" "$mhz" "$tcc" "$(( 100 - tcc ))" "$pct"
+    fi
+}
+
+# ---- Ações ------------------------------------------------------------------
+
+do_apply() {
+    apply_plan "$(plan_for_profile "$(acpi_profile)")"
+}
+
+do_status() {
+    local profile plan pl1 pl2 tcc maxpct curmax pkg maxcore fan mhz v
+
+    profile=$(acpi_profile)
+    plan=$(plan_for_profile "$profile")
+    pl1=$(read_file "$RAPL/constraint_0_power_limit_uw")
+    pl2=$(read_file "$RAPL/constraint_1_power_limit_uw")
+    tcc=$(find_tcc)
+    [ -n "$tcc" ] && tcc=$(read_file "$tcc")
+    maxpct=$(read_file /sys/devices/system/cpu/intel_pstate/max_perf_pct)
+    curmax=$(read_file /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq)
+
+    if [ -n "$pl1" ]; then pl1=$(( pl1 / 1000000 )); else pl1="?"; fi
+    if [ -n "$pl2" ]; then pl2=$(( pl2 / 1000000 )); else pl2="?"; fi
+
+    pkg="?"
+    for z in /sys/class/thermal/thermal_zone*; do
+        if [ "$(read_file "$z/type")" = "x86_pkg_temp" ]; then
+            v=$(read_file "$z/temp")
+            [ -n "$v" ] && pkg=$(( v / 1000 ))
+            break
+        fi
+    done
+
+    maxcore=0
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(read_file "$h/name")" = "coretemp" ] || continue
+        for f in "$h"/temp*_input; do
+            [ -e "$f" ] || continue
+            v=$(read_file "$f")
+            [ -n "$v" ] || continue
+            v=$(( v / 1000 ))
+            [ "$v" -gt "$maxcore" ] && maxcore=$v
+        done
+    done
+
+    fan="?"
+    for f in /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/fan1_input; do
+        [ -e "$f" ] && fan=$(read_file "$f") && break
+    done
+
+    mhz="?"
+    mhz=$(awk '/cpu MHz/{s+=$4;n++} END{if(n) printf "%d", s/n; else print "?"}' /proc/cpuinfo)
+
+    printf 'Perfil ACPI .......: %s\n' "$profile"
+    printf 'Plano aplicado ....: %s\n' "$plan"
+    printf 'Fonte .............: %s\n' "$(on_battery && echo 'bateria' || echo 'rede elétrica')"
+    local tcc_txt="?"
+    if [ -n "$tcc" ]; then tcc_txt=$(( 100 - tcc )); fi
+
+    printf 'PL1 / PL2 .........: %s W / %s W\n' "$pl1" "$pl2"
+    printf 'TCC offset ........: %s (throttle em ~%s °C)\n' "${tcc:-?}" "$tcc_txt"
+    printf 'max_perf_pct ......: %s %%\n' "$maxpct"
+    printf 'scaling_max_freq ..: %s MHz\n' "$(( ${curmax:-0} / 1000 ))"
+    printf 'Temp pacote / core : %s °C / %s °C\n' "$pkg" "$maxcore"
+    printf 'Frequência média ..: %s MHz\n' "$mhz"
+    printf 'Ventoinha .........: %s RPM\n' "$fan"
+
+    if [ -n "$pl1" ] && [ "$pl1" != "?" ] && [ "$pl1" -ge 28 ]; then
+        printf '\nAVISO: PL1 em %s W — o plano não está aplicado.\n' "$pl1"
+        printf 'Rode: sudo asus-power-plan apply\n'
+    fi
+}
+
+do_restore() {
+    local tccf maxmhz dir
+    wr "$RAPL/constraint_1_power_limit_uw" 28000000
+    wr "$RAPL/constraint_0_power_limit_uw" 28000000
+    if tccf=$(find_tcc); then
+        wr "$tccf" 8
+    fi
+    wr /sys/devices/system/cpu/intel_pstate/max_perf_pct 100
+    maxmhz=$(cpu_max_mhz)
+    for dir in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$dir" ] || continue
+        wr "$dir/scaling_max_freq" $(( maxmhz * 1000 ))
+    done
+    echo "Limites de fábrica restaurados (PL1/PL2 28 W, 4,2 GHz, TCC offset 8)."
+}
+
+usage() {
+    cat <<'EOF'
+Uso: asus-power-plan [apply|status|restore]
+
+  apply     aplica o plano correspondente ao perfil ACPI atual
+  status    mostra limites, temperaturas e ventoinha
+  restore   volta aos limites de fábrica
+EOF
+}
+
+case "${1:-apply}" in
+    apply)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "asus-power-plan: 'apply' precisa de root." >&2
+            exit 1
+        fi
+        do_apply
+        ;;
+    status)  do_status ;;
+    restore)
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "asus-power-plan: 'restore' precisa de root." >&2
+            exit 1
+        fi
+        do_restore
+        ;;
+    -v|--verbose) VERBOSE=1; do_apply ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac

@@ -1,0 +1,5 @@
+# Reaplica os limites quando o perfil ACPI muda (KDE/PPD).
+ACTION=="change", SUBSYSTEM=="platform-profile", RUN+="/usr/local/bin/asus-power-plan apply"
+
+# Reaplica quando o carregador é conectado ou desconectado.
+ACTION=="change", SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_TYPE}=="Mains", RUN+="/usr/local/bin/asus-power-plan apply"

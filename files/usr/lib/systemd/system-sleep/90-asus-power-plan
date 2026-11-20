@@ -1,0 +1,9 @@
+#!/bin/sh
+# Reaplica os limites depois de voltar da suspensão/hibernação.
+# Alguns firmwares resetam RAPL e TCC offset no resume.
+case "$1" in
+    post)
+        /usr/local/bin/asus-power-plan apply
+        ;;
+esac
+exit 0
